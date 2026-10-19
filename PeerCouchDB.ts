@@ -8,9 +8,11 @@ import { PeerCouchDBConf, FileData } from "./types.ts";
 import { decodeBinary } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/convert";
 import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
 import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
+import { normaliseIdDerivationKey } from "./util.ts";
 import {
     createBinaryBlob,
     createTextBlob,
+    getDocData,
     isDocContentSame,
     unique,
 } from "@vrtmrz/livesync-commonlib/compat/common/utils";
@@ -31,10 +33,23 @@ export class PeerCouchDB extends Peer {
     private _remoteEmpty = false;
     constructor(conf: PeerCouchDBConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
+        const idDerivationKey = normaliseIdDerivationKey(this.config.idDerivationKey);
+        this.config.idDerivationKey = idDerivationKey;
+        if (idDerivationKey) {
+            // The manipulator checks remote document IDs before remote tweaks are applied, so a configured key must select version 1 up front
+            this.config.idDerivationVersion ??= 1;
+        }
         // The manipulator is built lazily in start(), only after a probe confirms
         // CouchDB is reachable. Building it here would start its one-shot init
         // against a possibly-down CouchDB, then discard and rebuild it on the
         // first successful connection.
+    }
+    override _getKey(key: string): string {
+        if (key !== "since" && key !== "remote-created") return super._getKey(key);
+        const url = new URL(this.config.url);
+        // Include reverse-proxy paths, but keep credentials out of persisted keys.
+        const endpoint = `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+        return `couchdb-checkpoint:${JSON.stringify([this.config.name, this.config.baseDir, endpoint, this.config.database, key])}`;
     }
     // (Re)create the underlying DirectFileManipulator. Its constructor starts a
     // one-shot async database initialisation. Recovering from a failed attempt
@@ -50,8 +65,8 @@ export class PeerCouchDB extends Peer {
             // Bypass node:http compatibility shims for Deno, Traefik, and long-polling connections.
             fetch: (request, init) => globalThis.fetch(request, init),
         });
-        // Fetch remote since.
-        this.man.since = this.getSetting("since") || "now";
+        // Unbound legacy checkpoints are not reused; read this remote from the beginning.
+        this.man.since = this.getSetting("since") ?? "";
         if (prev) void prev.close().catch(() => {});
     }
     async delete(pathSrc: string): Promise<boolean> {
@@ -246,6 +261,8 @@ export class PeerCouchDB extends Peer {
                     this.config.customChunkSize = tweaks.customChunkSize ?? this.config.customChunkSize;
                     this.config.doNotUseFixedRevisionForChunks = tweaks.doNotUseFixedRevisionForChunks ?? this.config.doNotUseFixedRevisionForChunks;
                     this.config.handleFilenameCaseSensitive = tweaks.handleFilenameCaseSensitive ?? this.config.handleFilenameCaseSensitive;
+                    this.config.idDerivationVersion = tweaks.idDerivationVersion ?? this.config.idDerivationVersion;
+                    this.config.encryptInternalMetadata = tweaks.encryptInternalMetadata ?? this.config.encryptInternalMetadata;
                     const newConf = { ...this.config } as Record<string, any>;
                     this.man.options = this.config;
                     await this.man.liveSyncLocalDB.initializeDatabase()
@@ -262,6 +279,8 @@ export class PeerCouchDB extends Peer {
             }
             if (!w) {
                 this.normalLog(`Remote database looks like empty. fetch from the first.`);
+                this.man.since = "";
+                this.setSetting("since", "");
                 this.setSetting("remote-created", "0");
                 // Connected fine; there's just nothing to watch yet. Mark it so health
                 // counts this as syncing rather than a stuck "not watching" state.
@@ -271,12 +290,13 @@ export class PeerCouchDB extends Peer {
             const created = w.created;
             if (this.getSetting("remote-created") !== `${created}`) {
                 this.man.since = "";
+                this.setSetting("since", "");
                 this.normalLog(`Remote database looks like rebuilt. fetch from the first again.`);
                 this.setSetting("remote-created", `${created}`);
             } else {
                 this.normalLog(`Watch starting from ${this.man.since}`);
             }
-            this.man.beginWatch(async (entry) => {
+            this.man.beginWatch(async (entry, seq) => {
                 const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
                 let path = entry.path.substring(baseDir.length);
                 if (path.startsWith("/")) {
@@ -293,8 +313,9 @@ export class PeerCouchDB extends Peer {
                     this.sendLog(`${path} change detected`);
                     await this.dispatch(path, docData);
                 }
+                // Save this callback's position after dispatch has returned.
+                this.advanceSince(seq);
             }, (entry) => {
-                this.setSetting("since", this.man.since);
                 if (entry.path.indexOf(":") !== -1) {
                     if (this.config.includeInternal && entry.path.startsWith("i:")) {
                         const stripped = entry.path.substring(2);
@@ -306,8 +327,28 @@ export class PeerCouchDB extends Peer {
             });
         }
     }
+    // Commonlib passes seq to the callback without updating man.since. Keep both
+    // the reconnect position and the peer's saved position after dispatch.
+    // Concurrent callbacks can still finish out of order, and earlier pending or
+    // failed changes are not guaranteed to be replayed by this checkpoint alone.
+    advanceSince(seq?: string | number): void {
+        if (seq === undefined || seq === null || `${seq}` === "") return;
+        this.man.since = `${seq}`;
+        this.setSetting("since", `${seq}`);
+    }
     async dispatch(path: string, data: FileData | false) {
         if (data === false) return;
+        // Reject inconsistent empty data before recording repeats or delivering it to peers.
+        // A later valid empty update must still be dispatched.
+        if (data.size > 0 && (data.data instanceof Uint8Array
+            ? data.data.byteLength === 0
+            : getDocData(data.data).length === 0)) {
+            this.normalLog(
+                `Empty update blocked: ${path} (${data.size} bytes reported, 0 bytes received)`,
+                LOG_LEVEL_NOTICE,
+            );
+            return;
+        }
         if (!await this.isRepeating(path, data)) {
             await this.dispatchToHub(this, this.toGlobalPath(path), data);
         }
